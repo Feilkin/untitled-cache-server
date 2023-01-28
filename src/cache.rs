@@ -185,6 +185,7 @@ impl TlruCache {
     }
 }
 
+/// Spawns the task for fetching this resource using provided fetch function
 fn fetch_entry<F, R>(fetch_function: F) -> (JoinHandle<CacheResult>, Watcher)
 where
     F: FnOnce() -> R + Send + Sync + 'static,
