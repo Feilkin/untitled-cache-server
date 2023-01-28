@@ -10,10 +10,14 @@ anyhow = "1.0"
 bytes = "1.3"  # for shared byte slices
 dashmap = "5.4"  # for shared hashmaps
 docopt = "1.1"  # for commandline argument parsing
+env_logger = "0.10"
 http-body-util = "0.1.0-rc.2"  # for handling response body
 hyper = { version = "1.0.0-rc.2", features = ["http1", "server"] }  # for HTTP handling
 reqwest = "0.11"
-rustls = "0.20"  # for TLS handling
+log = "0.4"
+rustls = {version ="0.20", features= ["logging"] }  # for TLS handling
+rustls-pemfile = "1.0"  # for reading server certificate
 tokio = { version = "1.24", features= ["rt-multi-thread", "net", "macros", "sync", "fs", "io-util"]}  # async runtime
+tokio-rustls = "0.23"  # for using rustls in tokio runtime
 thiserror = "1.0"  # for pretty error types :)
 serde = { version = "1.0", features = ["derive"] }  # for deserializing commandline arguments

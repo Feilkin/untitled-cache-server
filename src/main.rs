@@ -12,12 +12,14 @@ use hyper::http::uri::Scheme;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
+use rustls::{Certificate, PrivateKey};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio;
+use tokio::io::AsyncReadExt;
 
 use crate::cache::{CacheError, CacheResult, TlruCache};
 
@@ -114,6 +116,8 @@ async fn fetch_content(resource: String, fetch_settings: Arc<FetchSettings>) -> 
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    env_logger::init();
+
     println!("Untitled Cache Server {}", VERSION);
 
     let args: Args = Docopt::new(USAGE)
@@ -121,6 +125,16 @@ async fn main() -> Result<(), anyhow::Error> {
         .map(|d| d.version(Some(VERSION.to_owned())))
         .and_then(|d| d.deserialize())
         .unwrap_or_else(|e| e.exit());
+
+    let (certs, private_key) = load_certs_and_private_key(&args).await?;
+
+    let tls_config: tokio_rustls::TlsAcceptor = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(certs, private_key)?,
+    )
+    .into();
 
     let fetch_settings = Arc::new(FetchSettings::try_from(&args)?);
 
@@ -152,23 +166,31 @@ async fn main() -> Result<(), anyhow::Error> {
                 let (socket, client_address) = maybe_socket?;
                 let content_cache = Arc::clone(&content_cache);
                 let fetch_settings = Arc::clone(&fetch_settings);
+                let tls_config = tls_config.clone();
 
                 tokio::task::spawn(async move {
-                    // TODO: TLS
+                    match tls_config.accept(socket).await {
+                        Ok(connection) => {
+                            {
+                                if let Err(e) = http1::Builder::new()
+                                    .serve_connection(
+                                        connection,
+                                        service_fn(move |req| {
+                                            let content_cache = Arc::clone(&content_cache);
+                                            let fetch_settings = Arc::clone(&fetch_settings);
 
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(
-                            socket,
-                            service_fn(move |req| {
-                                let content_cache = Arc::clone(&content_cache);
-                                let fetch_settings = Arc::clone(&fetch_settings);
-
-                                handle_request(req, fetch_settings, content_cache, client_address.clone())
-                            }),
-                        )
-                        .await
-                    {
-                        eprintln!("failed to serve {}: {}", client_address, e);
+                                            handle_request(req, fetch_settings, content_cache, client_address.clone())
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    eprintln!("failed to serve {}: {}", client_address, e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("failed to establish TLS connection: {}", e);
+                        }
                     }
                 });
             },
@@ -225,4 +247,37 @@ async fn handle_request(
     };
 
     Ok(response)
+}
+
+/// Load certificate and private key from specified files
+///
+/// This method is largely adapted from https://github.com/rustls/rustls/blob/main/examples/src/bin/tlsserver-mio.rs
+async fn load_certs_and_private_key(args: &Args) -> anyhow::Result<(Vec<Certificate>, PrivateKey)> {
+    let mut certfile = tokio::fs::File::open(&args.flag_cert).await?;
+    let mut contents = Vec::new();
+    certfile.read_to_end(&mut contents).await?;
+
+    let certs = rustls_pemfile::certs(&mut &contents[..])?
+        .into_iter()
+        .map(|v| rustls::Certificate(v))
+        .collect();
+
+    contents.clear();
+    let mut keyfile = tokio::fs::File::open(&args.flag_key).await?;
+    keyfile.read_to_end(&mut contents).await?;
+
+    // I have no idea why we loop here :shrug:
+    let key = loop {
+        match rustls_pemfile::read_one(&mut &contents[..])
+            .expect("cannot parse private key .pem file")
+        {
+            Some(rustls_pemfile::Item::RSAKey(key)) => break rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::PKCS8Key(key)) => break rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::ECKey(key)) => break rustls::PrivateKey(key),
+            None => return Err(anyhow!("no valid private key found in key file")),
+            _ => {}
+        }
+    };
+
+    Ok((certs, key))
 }
