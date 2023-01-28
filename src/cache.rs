@@ -8,21 +8,22 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use dashmap::mapref::entry::{Entry, VacantEntry};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use hyper::HeaderMap;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[derive(Error, Clone, Debug)]
 pub enum CacheError {
-    #[error("failed to fetch resource")]
-    Fetch(#[from] Arc<dyn std::error::Error + Send + Sync>),
+    #[error("failed to fetch resource: {0}")]
+    Fetch(Arc<dyn std::error::Error + Send + Sync>, u16),
     #[error("unexpected error")]
     Unknown,
 }
 
-pub type CacheResult = Result<(Bytes, Instant), CacheError>;
+pub type CacheResult = Result<(Bytes, Arc<HeaderMap>, Instant), CacheError>;
 
 type Watcher = watch::Receiver<Option<CacheResult>>;
 
@@ -30,6 +31,7 @@ enum CacheEntry {
     Cached {
         /// The cached bytes
         data: Bytes,
+        headers: Arc<HeaderMap>,
         /// Time last accessed
         last_accessed: Instant,
         /// Expiration time
@@ -61,6 +63,16 @@ impl TlruCache {
         }
     }
 
+    pub fn diagnostics(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.cache.len(),
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+            self.current_size.load(Ordering::Relaxed),
+            self.max_size,
+        )
+    }
+
     pub async fn get_or_fetch<F, R>(&self, resource: &str, fetch_function: F) -> CacheResult
     where
         F: FnOnce() -> R + Send + Sync + 'static,
@@ -83,6 +95,7 @@ impl TlruCache {
                 }
                 CacheEntry::Cached {
                     data,
+                    headers,
                     last_accessed,
                     expires,
                 } => {
@@ -91,6 +104,7 @@ impl TlruCache {
                     (
                         Some(CacheEntry::Cached {
                             data: data.clone(),
+                            headers: Arc::clone(headers),
                             last_accessed: last_accessed.clone(),
                             expires: expires.clone(),
                         }),
@@ -111,8 +125,15 @@ impl TlruCache {
 
         if let Some(entry) = maybe_entry {
             // resource was in cache, or being fetched to the cache
+            self.hits.fetch_add(1, Ordering::Relaxed);
+
             match entry {
-                CacheEntry::Cached { data, expires, .. } => Ok((data, expires)),
+                CacheEntry::Cached {
+                    data,
+                    headers,
+                    expires,
+                    ..
+                } => Ok((data, headers, expires)),
                 CacheEntry::Fetching(mut watcher) => loop {
                     if let Some(result) = watcher.borrow_and_update().deref() {
                         break result.clone();
@@ -125,18 +146,20 @@ impl TlruCache {
                 },
             }
         } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
             let task_handle = fetch_task.expect("should have either result or fetch task");
 
             match task_handle.await {
                 Ok(result) => {
                     match &result {
-                        Ok((data, expires)) => {
+                        Ok((data, headers, expires)) => {
                             self.make_fit(data.len());
 
                             self.cache.insert(
                                 hash,
                                 CacheEntry::Cached {
                                     data: data.clone(),
+                                    headers: Arc::clone(headers),
                                     last_accessed: Instant::now(),
                                     expires: expires.clone(),
                                 },
@@ -172,7 +195,9 @@ where
     let join_handle = tokio::task::spawn(async move {
         let result = fetch_function().await;
 
-        sender.send(Some(result.clone()));
+        sender
+            .send(Some(result.clone()))
+            .map_err(|_| CacheError::Unknown)?;
 
         result
     });
@@ -182,20 +207,26 @@ where
 impl TlruCache {
     /// Evict entries until there is room for required number of bytes
     fn make_fit(&self, bytes: usize) {
+        assert!(bytes <= self.max_size);
+
         let current_size = self.current_size.load(Ordering::SeqCst);
         if current_size + bytes >= self.max_size {
             let mut to_remove = (current_size + bytes - self.max_size) as isize;
             println!("freeing {} bytes", to_remove);
 
             while to_remove > 0 {
-                to_remove - self.evict_one() as isize;
+                to_remove -= self.evict_one() as isize;
             }
         }
     }
 
     /// Evict one entry from the cache, returning how many bytes were freed
     fn evict_one(&self) -> usize {
-        let mut lowest = (*self.cache.iter().next().unwrap().key(), Instant::now(), 0);
+        if self.cache.len() == 0 {
+            return 0;
+        }
+
+        let mut lowest = (0, Instant::now(), 0);
 
         for entry in self.cache.iter() {
             let key = *entry.key();
