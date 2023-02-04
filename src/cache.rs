@@ -63,6 +63,7 @@ impl TlruCache {
         }
     }
 
+    #[tracing::instrument(skip(self), level = "error")]
     pub fn diagnostics(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.cache.len(),
@@ -73,6 +74,7 @@ impl TlruCache {
         )
     }
 
+    #[tracing::instrument(skip(self, fetch_function), level = "trace")]
     pub async fn get_or_fetch<F, R>(&self, resource: &str, fetch_function: F) -> CacheResult
     where
         F: FnOnce() -> R + Send + Sync + 'static,
@@ -166,7 +168,7 @@ impl TlruCache {
                             );
 
                             // TODO: figure out the best ordering
-                            self.current_size.fetch_add(data.len(), Ordering::SeqCst);
+                            self.current_size.fetch_add(data.len(), Ordering::Relaxed);
                         }
                         Err(_) => {
                             self.cache.remove(&hash);
@@ -186,6 +188,7 @@ impl TlruCache {
 }
 
 /// Spawns the task for fetching this resource using provided fetch function
+#[tracing::instrument(skip(fetch_function))]
 fn fetch_entry<F, R>(fetch_function: F) -> (JoinHandle<CacheResult>, Watcher)
 where
     F: FnOnce() -> R + Send + Sync + 'static,
@@ -193,24 +196,28 @@ where
 {
     let (sender, watcher) = watch::channel(None);
 
-    let join_handle = tokio::task::spawn(async move {
-        let result = fetch_function().await;
+    let join_handle = tokio::task::Builder::new()
+        .name("fetch content")
+        .spawn(async move {
+            let result = fetch_function().await;
 
-        sender
-            .send(Some(result.clone()))
-            .map_err(|_| CacheError::Unknown)?;
+            sender
+                .send(Some(result.clone()))
+                .map_err(|_| CacheError::Unknown)?;
 
-        result
-    });
+            result
+        })
+        .unwrap();
     (join_handle, watcher)
 }
 
 impl TlruCache {
     /// Evict entries until there is room for required number of bytes
+    #[tracing::instrument(skip(self))]
     fn make_fit(&self, bytes: usize) {
         assert!(bytes <= self.max_size);
 
-        let current_size = self.current_size.load(Ordering::SeqCst);
+        let current_size = self.current_size.load(Ordering::Relaxed);
         if current_size + bytes >= self.max_size {
             let mut to_remove = (current_size + bytes - self.max_size) as isize;
             println!("freeing {} bytes", to_remove);
@@ -222,6 +229,7 @@ impl TlruCache {
     }
 
     /// Evict one entry from the cache, returning how many bytes were freed
+    #[tracing::instrument(skip(self))]
     fn evict_one(&self) -> usize {
         if self.cache.len() == 0 {
             return 0;
@@ -245,9 +253,7 @@ impl TlruCache {
             }
         }
 
-        self.cache
-            .remove(&lowest.0)
-            .expect("cache entry disappeared");
+        self.cache.remove(&lowest.0);
 
         self.current_size.fetch_sub(lowest.2, Ordering::SeqCst);
 

@@ -18,8 +18,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsAcceptor;
 
 use crate::cache::{CacheError, CacheResult, TlruCache};
 
@@ -49,6 +50,7 @@ struct Args {
     flag_key: String,
 }
 
+#[derive(Debug)]
 struct FetchSettings {
     backend_url: String,
 }
@@ -89,6 +91,7 @@ impl TryFrom<&Args> for FetchSettings {
     }
 }
 
+#[tracing::instrument]
 async fn fetch_content(resource: String, fetch_settings: Arc<FetchSettings>) -> CacheResult {
     let map_reqwest_error = |e: reqwest::Error| {
         let status_code = e
@@ -114,9 +117,10 @@ async fn fetch_content(resource: String, fetch_settings: Arc<FetchSettings>) -> 
     Ok((bytes, headers, Instant::now() + Duration::from_secs(30)))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() -> Result<(), anyhow::Error> {
-    env_logger::init();
+    console_subscriber::init();
+    // env_logger::init();
 
     println!("Untitled Cache Server {}", VERSION);
 
@@ -168,31 +172,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 let fetch_settings = Arc::clone(&fetch_settings);
                 let tls_config = tls_config.clone();
 
-                tokio::task::spawn(async move {
-                    match tls_config.accept(socket).await {
-                        Ok(connection) => {
-                            {
-                                if let Err(e) = http1::Builder::new()
-                                    .serve_connection(
-                                        connection,
-                                        service_fn(move |req| {
-                                            let content_cache = Arc::clone(&content_cache);
-                                            let fetch_settings = Arc::clone(&fetch_settings);
-
-                                            handle_request(req, fetch_settings, content_cache, client_address.clone())
-                                        }),
-                                    )
-                                    .await
-                                {
-                                    eprintln!("failed to serve {}: {}", client_address, e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("failed to establish TLS connection: {}", e);
-                        }
-                    }
-                });
+                tokio::task::Builder::new()
+                    .name("handle connection")
+                    .spawn(handle_socket_connection(socket, client_address, tls_config, content_cache, fetch_settings)).unwrap();
             },
 
             () = &mut diagnostics_tick => {
@@ -205,17 +187,50 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 }
 
+#[tracing::instrument(skip_all)]
+async fn handle_socket_connection(
+    socket: TcpStream,
+    client_address: SocketAddr,
+    tls_config: TlsAcceptor,
+    content_cache: Arc<TlruCache>,
+    fetch_settings: Arc<FetchSettings>,
+) {
+    match tls_config.accept(socket).await {
+        Ok(connection) => {
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(
+                    connection,
+                    service_fn(move |req| {
+                        let content_cache = Arc::clone(&content_cache);
+                        let fetch_settings = Arc::clone(&fetch_settings);
+
+                        handle_request(req, fetch_settings, content_cache, client_address.clone())
+                    }),
+                )
+                .await
+            {
+                eprintln!("failed to serve {}: {}", client_address, e);
+            }
+        }
+        Err(e) => {
+            eprintln!("failed to establish TLS connection: {}", e);
+        }
+    }
+}
+
 /// Handle incoming HTTP request.
 ///
 /// At this point the request has been parsed, but the body might still be streaming. We don't care
 /// about the request body so this is fine.
+#[tracing::instrument(skip(content_cache))]
 async fn handle_request(
     req: Request<Incoming>,
     fetch_settings: Arc<FetchSettings>,
     content_cache: Arc<TlruCache>,
     client_address: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
-    println!("{}: {}", client_address, req.uri().path());
+    // println!("{}: {}", client_address, req.uri().path());
 
     let path = req.uri().path().to_owned();
 
